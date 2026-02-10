@@ -364,6 +364,15 @@ class CustomisedDLE(DistributedLearningEngine):
         self.num_classes = num_classes
         # self.scaler = amp.GradScaler(enabled=True)
 
+    def _on_start_iteration(self):
+        self._state.iteration += 1
+        self._state.inputs = pocket.ops.relocate_to_cuda(self._state.inputs, non_blocking=True)
+     
+        file = [tgt['filename'] for tgt in self._state.targets]
+        self._state.targets = pocket.ops.relocate_to_cuda(self._state.targets, non_blocking=True, ignore=True)
+        for idx, tgti in enumerate(self._state.targets):
+            self._state.targets[idx]['filename'] = (file[idx])
+
     def _on_each_iteration(self):
         # with amp.autocast(enabled=True):
         loss_dict = self._state.net(
