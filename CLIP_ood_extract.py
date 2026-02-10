@@ -29,7 +29,7 @@ for mode in mode_list:
         img_path = "/workspace/dataset/swig-hoi/images_512"
 
         file_name_clippart = 'clip336' if clip_mode == 'ViT-L/14@336px' else 'clipbase'
-        folder = 'hicodet_pkl_files/'+file_name_clippart+'_img_ood_'+mode
+        folder = 'hicodet_pkl_files/'+file_name_clippart+'_img_hicodet_'+mode
         if os.path.exists(folder) is False:
             os.makedirs(folder)
 
