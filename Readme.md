@@ -8,7 +8,7 @@
 在训练和评测之前，先提取 OOD 数据集的特征：
 
 ```shell
-bash CLIP_ood_extract.py
+python CLIP_ood_extract.py
 ```
 
 训练指令：
