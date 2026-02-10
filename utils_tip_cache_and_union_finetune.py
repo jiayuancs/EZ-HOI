@@ -358,11 +358,13 @@ class CacheTemplate(defaultdict):
 
 from torch.cuda import amp
 class CustomisedDLE(DistributedLearningEngine):
-    def __init__(self, net, dataloader, max_norm=0, num_classes=117, **kwargs):
-        super().__init__(net, None, dataloader, **kwargs)
+    def __init__(self, net, train_dataloader, test_dataloader, ood_dataloader, max_norm=0, num_classes=117, **kwargs):
+        super().__init__(net, None, train_dataloader, **kwargs)
         self.max_norm = max_norm
         self.num_classes = num_classes
         # self.scaler = amp.GradScaler(enabled=True)
+        self.test_dataloader = test_dataloader
+        self.ood_dataloader = ood_dataloader
 
     def _on_start_iteration(self):
         self._state.iteration += 1
@@ -390,7 +392,8 @@ class CustomisedDLE(DistributedLearningEngine):
 
 
     @torch.no_grad()
-    def test_hico(self, dataloader, args=None):
+    def test_hico(self, args=None):
+        dataloader = self.test_dataloader
         net = self._state.net
         net.eval()
         dataset = dataloader.dataset.dataset
@@ -418,6 +421,9 @@ class CustomisedDLE(DistributedLearningEngine):
         text_label_list = []
         name_list = {}
         pred_list = {}
+
+        all_label = []
+        all_logit = []
         for batch in tqdm(dataloader):
             inputs = pocket.ops.relocate_to_cuda(batch[0])
 
@@ -445,6 +451,45 @@ class CustomisedDLE(DistributedLearningEngine):
                     # Recover target box scale
                     gt_bx_h = net.module.recover_boxes(target['boxes_h'], target['size'])
                     gt_bx_o = net.module.recover_boxes(target['boxes_o'], target['size'])
+
+                    # -------------- OOD 任务 ------------ #
+                    # ctw = output["ctw"]
+                    # atd = output["atd"]
+                    # all_ctw.append(ctw)
+                    # all_atd.append(atd)
+                    all_scores = output['all_scores']   # [ho_pairs_cnt, 117]
+                    ood_boxes_h, ood_boxes_o = boxes[output['all_pairings']].unbind(0)
+                    all_objects = output["all_objects"]
+
+                    # 仅使用匹配的边界框计算OOD性能
+                    # 匹配边界框，得到 ground-truth 标签(1 表示 ID 人物对，0 表示 OOD 人物对)
+                    # target['object']
+                    # all_objects
+                    unique_object = all_objects.unique()
+                    for obj_idx in unique_object:
+                        gt_idx = torch.nonzero(target['object'] == obj_idx).squeeze(1)
+                        det_idx = torch.nonzero(all_objects == obj_idx).squeeze(1)
+                        if len(gt_idx):
+                            ood_label = associate(
+                                (gt_bx_h[gt_idx].view(-1, 4),
+                                gt_bx_o[gt_idx].view(-1, 4)),
+                                (ood_boxes_h[det_idx].view(-1, 4),
+                                ood_boxes_o[det_idx].view(-1, 4)),
+                                None   # 对于重复匹配的人物对，仅保留 IoU 最大的人物对
+                            )
+                            # 仅保留与 ground-truth 匹配的 人物对
+                            d2idxs = torch.nonzero(ood_label, as_tuple=False)
+                            idxs = det_idx[d2idxs]
+                            pos_score = all_scores[idxs].squeeze(1)
+
+                            # 匹配的人物对
+                            all_label.append(torch.ones_like(idxs))
+                            all_logit.append(pos_score)
+
+                    # all_label.append(ood_label)
+                    # assert len(ood_label) == len(cur_ing_logits)
+                    # ---------------- END -------------- #  
+                    
                     # Associate detected pairs with ground truth pairs
                     labels = torch.zeros_like(scores)
                     unique_hoi = interactions.unique()
@@ -531,7 +576,14 @@ class CustomisedDLE(DistributedLearningEngine):
                             cv2.imwrite( save_path, img_result)
 
                     meter.append(scores, interactions, labels)  
-        return meter.eval()
+
+        match_ood_results = {
+            "label": torch.cat(all_label).squeeze(-1).numpy(),
+            "logit": torch.cat(all_logit).numpy()
+        }
+
+        return meter.eval(), match_ood_results
+
 
     def random_color(self):
         rdn = random.randint(1, 1000)
