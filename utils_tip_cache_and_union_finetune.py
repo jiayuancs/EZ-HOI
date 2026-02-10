@@ -585,6 +585,83 @@ class CustomisedDLE(DistributedLearningEngine):
         return meter.eval(), match_ood_results
 
 
+    @torch.no_grad()
+    def test_hico_ood(self):
+        dataloader = self.ood_dataloader
+        net = self._state.net
+        net.eval()
+
+        associate = BoxPairAssociation(min_iou=0.5)
+
+        count = 0
+
+        all_label = []
+        all_logit = []
+        for batch in tqdm(dataloader):
+            inputs = pocket.ops.relocate_to_cuda(batch[0])
+
+            outputs = net(inputs,batch[1])
+            # Skip images without detections
+            if outputs is None or len(outputs) == 0:
+                continue
+
+            else:
+                for output, target in zip(outputs, batch[-1]):
+                    count += 1
+                    output = pocket.ops.relocate_to_cpu(output, ignore=True)
+                    # Format detections
+                    boxes = output['boxes']
+                    boxes_h, boxes_o = boxes[output['pairing']].unbind(0)
+                    objects = output['objects']
+                    scores = output['scores']
+                    verbs = output['labels']
+
+                    # Recover target box scale
+                    gt_bx_h = net.module.recover_boxes(target['boxes_h'], target['size'])
+                    gt_bx_o = net.module.recover_boxes(target['boxes_o'], target['size'])
+
+                    # -------------- OOD 任务 ------------ #
+                    # ctw = output["ctw"]
+                    # atd = output["atd"]
+                    # all_ctw.append(ctw)
+                    # all_atd.append(atd)
+                    all_scores = output['all_scores']   # [ho_pairs_cnt, 117]
+                    ood_boxes_h, ood_boxes_o = boxes[output['all_pairings']].unbind(0)
+                    all_objects = output["all_objects"]
+
+                    # 仅使用匹配的边界框计算OOD性能
+                    # 匹配边界框，得到 ground-truth 标签(1 表示 ID 人物对，0 表示 OOD 人物对)
+                    # target['object']
+                    # all_objects
+                    unique_object = all_objects.unique()
+                    for obj_idx in unique_object:
+                        gt_idx = torch.nonzero(target['object'] == obj_idx).squeeze(1)
+                        det_idx = torch.nonzero(all_objects == obj_idx).squeeze(1)
+                        if len(gt_idx):
+                            ood_label = associate(
+                                (gt_bx_h[gt_idx].view(-1, 4),
+                                gt_bx_o[gt_idx].view(-1, 4)),
+                                (ood_boxes_h[det_idx].view(-1, 4),
+                                ood_boxes_o[det_idx].view(-1, 4)),
+                                None   # 对于重复匹配的人物对，仅保留 IoU 最大的人物对
+                            )
+                            # 仅保留与 ground-truth 匹配的 人物对
+                            d2idxs = torch.nonzero(ood_label, as_tuple=False)
+                            idxs = det_idx[d2idxs]
+                            pos_score = all_scores[idxs].squeeze(1)
+
+                            # 匹配的人物对
+                            all_label.append(torch.zeros_like(idxs))
+                            all_logit.append(pos_score)
+                    # ---------------- END -------------- #  
+
+        match_ood_results = {
+            "label": torch.cat(all_label).squeeze(-1).numpy(),
+            "logit": torch.cat(all_logit).numpy()
+        }
+
+        return match_ood_results
+
     def random_color(self):
         rdn = random.randint(1, 1000)
         b = int(rdn * 997) % 255
@@ -761,3 +838,44 @@ class CustomisedDLE(DistributedLearningEngine):
         with open(os.path.join(cache_dir, 'cache.pkl'), 'wb') as f:
             # Use protocol 2 for compatibility with Python2
             pickle.dump(all_results, f, 2)
+
+
+def _cal_auc_fpr(id_ness, labels):
+    auroc = metrics.roc_auc_score(labels, id_ness)
+    fpr,tpr,thresh = Roc(labels, id_ness, pos_label=1)
+    fpr = float(interpolate.interp1d(tpr, fpr)(0.95))
+    return auroc, fpr
+
+to_np = lambda x: x.detach().cpu().numpy()
+def max_logit_score(logits):
+    return to_np(torch.max(logits, -1)[0])
+def msp_score(logits):
+    prob = torch.softmax(logits, -1)
+    return to_np(torch.max(prob, -1)[0])
+def energy_score(logits):
+    return to_np(torch.logsumexp(logits, -1))
+
+def merge_ood_results(ood_results_lh, ood_results_rh):
+    """合并两个 OOD 任务输出的结果"""
+    all_results = {}
+    assert ood_results_lh.keys() == ood_results_rh.keys()
+    for key in ood_results_lh.keys():
+        lh_res = ood_results_lh[key]
+        rh_res = ood_results_rh[key]
+        all_results[key] = np.concatenate((lh_res, rh_res), axis=0)
+    return all_results
+
+def evaluate_ood_results(ood_results):
+    """评估 OOD 任务输出的结果"""
+    # ground-truth
+    label_key_name = "label"
+    labels = ood_results[label_key_name]  # [n, 1]
+
+    eval_results = {}
+    for key, value in ood_results.items():
+        if key == label_key_name:
+            continue
+        auroc, fpr = _cal_auc_fpr(id_ness=value, labels=labels)
+        eval_results[key] = (auroc, fpr)
+    
+    return eval_results
